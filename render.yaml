@@ -5,8 +5,11 @@ services:
     plan: free
     autoDeploy: true
     buildCommand: |
-      apt-get update && apt-get install -y openjdk-17-jdk
+      apt-get update
+      apt-get install -y openjdk-17-jdk
+      pip install --upgrade pip
       pip install -r requirements.txt
+      pip install androguard
     startCommand: |
       python bot.py
     envVars:
