@@ -10,11 +10,12 @@ import json
 import logging
 import tempfile
 import zipfile
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List
 
-from flask import Flask, request
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -33,12 +34,14 @@ from firebase_extractor import (
 )
 from firebase_checker import check_firebase_configs, generate_security_report
 
-# Configuration
+# ==================== Configuration ====================
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set!")
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+PORT = int(os.environ.get("PORT", 10000))
 
 # Create directories
 DOWNLOAD_DIR = "./downloads"
@@ -57,13 +60,27 @@ logger = logging.getLogger(__name__)
 
 # Bot user data storage
 user_data_store = {}
-bulk_processing = {}
 
-# Flask app for webhook
+# Flask app for web server
 app = Flask(__name__)
 
 
+@app.route('/')
+def home():
+    """Home page for Render health check."""
+    return {"status": "ok", "message": "Firebase Extractor Bot is running!"}
+
+
+@app.route('/health')
+def health():
+    """Health check endpoint for Render."""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+
+# ==================== Telegram Bot Handlers ====================
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a welcome message when /start is issued."""
     user = update.effective_user
     welcome_text = f"""
 🔥 Welcome to the Firebase & API Key Extractor Bot, {user.first_name}!
@@ -88,6 +105,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send help message."""
     help_text = """
 📖 **How to Use This Bot**
 
@@ -137,24 +155,6 @@ async def handle_documents(update: Update, context: ContextTypes.DEFAULT_TYPE):
     documents = []
     if message.document:
         documents = [message.document]
-    elif message.media_group:
-        # Handle media group (multiple files)
-        documents = [doc.document for doc in message.media_group if doc.document]
-    else:
-        # Check for multiple documents in message
-        for entity in message.caption_entities or []:
-            if entity.type == "document":
-                pass
-
-    # Also check if there are multiple documents in the message
-    if not documents:
-        # Try to find all documents in the message
-        if hasattr(message, 'document'):
-            documents = [message.document]
-
-    # Also check for documents in the message.text
-    if not documents and message.document:
-        documents = [message.document]
 
     if not documents:
         await update.message.reply_text(
@@ -176,14 +176,6 @@ async def handle_documents(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if zip_files:
         await handle_zip_files(update, context, zip_files)
         return
-
-    # Check for ZIP in caption
-    if message.caption and '.zip' in message.caption.lower():
-        # Look for ZIP in the documents
-        for doc in documents:
-            if doc.file_name.endswith('.zip'):
-                await handle_zip_files(update, context, [doc])
-                return
 
     if not apks:
         await update.message.reply_text(
@@ -248,8 +240,6 @@ async def handle_documents(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_zip_files(update: Update, context: ContextTypes.DEFAULT_TYPE, zip_documents):
     """Handle ZIP files containing multiple APKs"""
-    user_id = update.effective_user.id
-
     for zip_doc in zip_documents:
         await update.message.reply_text(
             f"📥 Processing ZIP: `{zip_doc.file_name}`",
@@ -314,7 +304,7 @@ async def handle_zip_files(update: Update, context: ContextTypes.DEFAULT_TYPE, z
                     })
 
             # Generate summary
-            await generate_bulk_summary(update, context, results, user_id)
+            await generate_bulk_summary(update, context, results, update.effective_user.id)
 
             # Clean up
             os.remove(zip_path)
@@ -430,41 +420,16 @@ async def bulk_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle unknown commands."""
     await update.message.reply_text(
         "❌ Unknown command. Use /help to see available commands."
     )
 
 
-# ==================== Flask Webhook ====================
-
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    return {"status": "ok", "message": "Firebase Extractor Bot is running!"}
-
-
-@app.route('/webhook', methods=['POST'])
-async def webhook():
-    try:
-        data = request.get_json()
-        if not data:
-            return {"ok": False, "error": "No data"}, 400
-
-        update = Update.de_json(data, bot_app.bot)
-        await bot_app.process_update(update)
-        return {"ok": True}, 200
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return {"ok": False, "error": str(e)}, 500
-
-
-@app.route('/health', methods=['GET'])
-def health():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-
-# ==================== Main ====================
+# ==================== Main Application ====================
 
 def setup_application():
+    """Setup the bot application."""
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
@@ -479,17 +444,21 @@ def setup_application():
     return application
 
 
-# Global variable for the application
-bot_app = None
+# ==================== Start the Bot ====================
 
 if __name__ == "__main__":
     print("🤖 Starting Firebase Extractor Bot (Polling mode)...")
+    
+    # Setup the bot application
     bot_app = setup_application()
+    
+    # Run Flask web server in a separate thread for Render health checks
+    def run_flask():
+        app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
+    
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print(f"✅ Flask web server running on port {PORT}")
+    
+    # Start the Telegram bot (polling mode)
     bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
-else:
-    bot_app = setup_application()
-    if WEBHOOK_URL:
-        bot_app.bot.set_webhook(WEBHOOK_URL + '/webhook')
-        print(f"✅ Webhook set to: {WEBHOOK_URL}/webhook")
-    else:
-        print("⚠️ WEBHOOK_URL not set, using polling mode")
