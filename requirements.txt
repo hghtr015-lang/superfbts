@@ -1,5 +1,5 @@
 python-telegram-bot==20.7
-androguard==3.4.0
+androguard==4.1.0
 aiofiles==23.2.1
 requests==2.31.0
 gunicorn==21.2.0
